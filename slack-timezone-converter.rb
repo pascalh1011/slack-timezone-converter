@@ -33,16 +33,24 @@ http.use_ssl = true
 http.verify_mode = OpenSSL::SSL::VERIFY_NONE
 response = http.get(uri.request_uri)
 timezones = {}
+users = {}
+timezones_by_user_id = {}
 maxlen = 0
+
 JSON.parse(response.body)['members'].each do |user|
   offset, label = user['tz_offset'], user['tz_label']
   next if offset.nil? or offset == 0 or label.nil?
   timezones[label] = offset / 3600 unless timezones.has_key?(label)
-  maxlen = label.length if label.length > maxlen
+  timezones_by_user_id[user['id']] = offset
+  users[label] ||= Array.new
+  users[label] << user['name']
+  user_label = users[label].join(', ')
+  maxlen = user_label.length if user_label.length > maxlen
   DEFAULT_TIMEZONE = ActiveSupport::TimeZone[timezones[label]].tzinfo.name if user['id'] == CURRENT_USER
 end
 
-Time.zone = DEFAULT_TIMEZONE
+
+#Time.zone = DEFAULT_TIMEZONE
 
 # Connect to Slack
 
@@ -58,19 +66,31 @@ client.on :message do |data|
      !data['text'].gsub(/<[^>]+>/, '').match(/[0-9](([hH]([0123456789 ?:,;.]|$))|( ?[aA][mM])|( ?[pP][mM])|(:[0-9]{2}))/).nil?
     
     # Identify time patterns
-    begin
       text = data['text']
-      time = Time.zone.parse(text).utc
-      puts "[#{Time.now}] Got time #{time}"
+      Time.zone = ActiveSupport::TimeZone[timezones_by_user_id[data['user']]]
+      time = Time.zone.parse(text).utc 
+      puts "[#{Time.now}] Got time #{time} #{data.inspect}"
 
-      text = []
+      text = ["*#{time.strftime('%I:%M %p')}* in UTC is:\n\n"]
+
+      uri = URI.parse("https://slack.com/api/channels.info?token=#{TOKEN}&channel=#{data['channel']}")
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = true
+      http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+      response = http.get(uri.request_uri)
+
+      user_ids = JSON.parse(response.body)['channel']['members']
+
       i = 0
-      timezones.each do |label, offset|
+      timezones.each do |time_zone, offset|
+        next unless timezones_by_user_id.select { |k,v| user_ids.include?(k) && offset.to_i.hours == v }.any?
         i += 1
+        label = users[time_zone].join(', ')
         localtime = time + offset.to_i.hours
         emoji = slack_clock_emoji_from_time(localtime)
         space = " " * (maxlen - label.length)
-        message = "#{emoji} *#{localtime.strftime('%H:%M')}* `(#{label})#{space}`"
+        space = " "
+        message = "#{emoji} *#{localtime.strftime('%I:%M %p')}*: #{label}#{space}"
         message += (i % PER_LINE.to_i == 0) ? "\n" : " "
         text << message
       end
@@ -79,9 +99,9 @@ client.on :message do |data|
 
       puts "[#{Time.now}] Sending message..."
       client.send({ type: 'message', channel: data['channel'], text: text.join })
-    rescue
+    
       # Just ignore the message
-    end
+    
   end
 end
 
